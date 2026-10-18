@@ -11,8 +11,6 @@ import fitz  # PyMuPDF
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # --- POSTAVKE STRANICE ---
 st.set_page_config(
@@ -59,6 +57,7 @@ def dodaj_log(postojeci_log_json, poruka):
     return json.dumps(logovi, ensure_ascii=False)
 
 def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
+    """Slanje e-mail obavijesti koristeći Streamlit Secrets."""
     try:
         SMTP_SERVER = st.secrets["email"]["smtp_server"]
         SMTP_PORT = int(st.secrets["email"]["smtp_port"])
@@ -101,50 +100,70 @@ def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
         st.warning(f"Sustav nije uspio poslati e-mail obavijest: {e}")
         return False
 
-def generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice):
-    """Generira jedan A4 PDF s preslikom nacrta, napomenom i podrškom za hrvatska slova."""
+def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice):
+    """
+    Automatski prepoznaje SVE nacrte (stranice bez riječi 'Statistika') 
+    iz PanelWizard PDF-a i za svaki generira stranicu s napomenom i potpisom.
+    """
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # 1. Zaglavlje (uz uredan ispis broja otpremnice i imena s HR znakovima)
-    c.setFont("Helvetica-Bold", 13)
-    c.drawString(40, height - 35, "ELGRAD d.o.o. - POTVRDA REKLAMACIJE I POVRATA")
+    doc_nacrt = fitz.open(stream=nacrt_bytes, filetype="pdf")
     
-    c.setFont("Helvetica", 10)
-    otpr_tekst = f" | Otpremnica: {broj_otpremnice}" if broj_otpremnice else " | Otpremnica: Nije unesena"
-    c.drawString(40, height - 52, f"Radni nalog: {broj_naloga}{otpr_tekst}")
-    c.drawString(40, height - 67, f"Kupac: {kupac}   |   Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.date.today().strftime('%d.%m.%Y.')}")
-    c.line(40, height - 73, width - 40, height - 73)
+    # Filtriramo samo stranice koje su nacrti (ne sadrže riječ "Statistika")
+    nacrt_stranice = []
+    for page in doc_nacrt:
+        text = page.get_text()
+        if "Statistika" not in text:
+            nacrt_stranice.append(page)
+            
+    # Fallback ako nijedna stranica nije zadovoljila uvjet
+    if not nacrt_stranice:
+        nacrt_stranice = [doc_nacrt[0]]
 
-    # 2. Slika Nacrta
-    try:
-        doc_nacrt = fitz.open(stream=nacrt_bytes, filetype="pdf")
-        page = doc_nacrt[0]
-        pix = page.get_pixmap(dpi=150)
-        img_bytes = pix.tobytes("png")
-        img_reader = ImageReader(io.BytesIO(img_bytes))
-        c.drawImage(img_reader, 40, 160, width=515, height=580, preserveAspectRatio=True)
-    except Exception:
-        c.drawString(40, height / 2, "[Nije moguće prikazati vizualni nacrt]")
+    total_stranica = len(nacrt_stranice)
 
-    # 3. Dno stranice: Napomena i Potpis
-    c.line(40, 150, width - 40, 150)
-    c.rect(40, 80, width - 80, 60, fill=0)
+    for i, page in enumerate(nacrt_stranice):
+        # 1. Zaglavlje
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(40, height - 35, f"ELGRAD d.o.o. - POTVRDA REKLAMACIJE I POVRATA (Dio {i+1} od {total_stranica})")
+        
+        c.setFont("Helvetica", 10)
+        otpr_tekst = f" | Otpremnica: {broj_otpremnice}" if broj_otpremnice else " | Otpremnica: Nije unesena"
+        c.drawString(40, height - 52, f"Radni nalog: {broj_naloga}{otpr_tekst}")
+        c.drawString(40, height - 67, f"Kupac: {kupac}   |   Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.date.today().strftime('%d.%m.%Y.')}")
+        c.line(40, height - 73, width - 40, height - 73)
 
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(50, 128, "NAPOMENA O PREUZIMANJU I POVRATU REKLAMIRANOG MATERIJALA:")
-    c.setFont("Helvetica", 8)
-    c.drawString(50, 114, "• Kupac preuzima nove/zamjenske komade specificirane u dokumentu u potpunosti ispravne.")
-    c.drawString(50, 101, f"• NAPOMENA: Kupac je prilikom preuzimanja vratio sve reklamirane komade ({komada} kom - {dekor}).")
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(50, 88, "[  ] KUPAC JE VRATIO SVE KOMADE            [  ] KUPAC NIJE VRATIO SVE KOMADE")
+        # 2. Slika Nacrta za tekuću stranicu
+        try:
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            img_reader = ImageReader(io.BytesIO(img_bytes))
+            c.drawImage(img_reader, 40, 155, width=515, height=530, preserveAspectRatio=True)
+        except Exception:
+            c.drawString(40, height / 2, "[Nije moguće prikazati vizualni nacrt]")
 
-    c.setFont("Helvetica", 9)
-    c.drawString(50, 40, "Preuzeo kupac (potpis): _______________________")
-    c.drawString(320, 40, "Izdano / Potvrdio (potpis): _______________________")
+        # 3. Dno stranice: Napomena i Potpis
+        c.line(40, 145, width - 40, 145)
+        c.rect(40, 75, width - 80, 62, fill=0)
 
-    c.showPage()
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(50, 125, "NAPOMENA O PREUZIMANJU I POVRATU REKLAMIRANOG MATERIJALA:")
+        c.setFont("Helvetica", 8)
+        c.drawString(50, 111, "• Kupac preuzima nove/zamjenske komade specificirane u dokumentu u potpunosti ispravne.")
+        c.drawString(50, 98, f"• NAPOMENA: Kupac je prilikom preuzimanja vratio sve reklamirane komade ({komada} kom - {dekor}).")
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(50, 85, "[  ] KUPAC JE VRATIO SVE KOMADE            [  ] KUPAC NIJE VRATIO SVE KOMADE")
+
+        c.setFont("Helvetica", 9)
+        c.drawString(50, 38, "Preuzeo kupac (potpis): _______________________")
+        c.drawString(320, 38, "Izdano / Potvrdio (potpis): _______________________")
+
+        # Ako ima još nacrta, dodaj novu stranicu u PDF
+        if i < total_stranica - 1:
+            c.showPage()
+
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
@@ -165,13 +184,13 @@ if uloga == "1. Trgovac (Unos)":
     with st.form("unos_form"):
         col1, col2 = st.columns(2)
         with col1:
-            broj_naloga = st.text_input("Broj naloga (npr. P-26370614):")
+            broj_naloga = st.text_input("Broj naloga (npr. P-26353690A):")
             kupac = st.text_input("Ime i prezime / Naziv kupca (podržava č, ć, š, ž, đ):")
         with col2:
             dekor = st.text_input("Dekor / Naziv artikla:")
             komada = st.number_input("Broj reklamiranih komada:", min_value=1, value=1)
         
-        nacrt_file = st.file_uploader("Priložite PDF nacrta (PanelWizard):", type=["pdf"])
+        nacrt_file = st.file_uploader("Priložite PDF nacrta (PanelWizard - podržava i više materijala/stranica):", type=["pdf"])
         submit = st.form_submit_button("Spremi reklamaciju")
 
         if submit:
@@ -229,7 +248,7 @@ elif uloga == "2. Upravitelj (Potvrda)":
 # --- MODUL 3: BLAGAJNA ---
 elif uloga == "3. Blagajna (Ispis)":
     st.header("🖨️ Blagajna - Pretraga i ispis dokumenta za kupca")
-    upis_6 = st.text_input("Upišite zadnjih 6 znamenki naloga (npr. 370614):", max_chars=6)
+    upis_6 = st.text_input("Upišite zadnjih 6 znamenki naloga (npr. 353690):", max_chars=6)
 
     if upis_6:
         conn = sqlite3.connect("reklamacije.db")
@@ -242,9 +261,9 @@ elif uloga == "3. Blagajna (Ispis)":
             broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom)")
 
-            pdf_za_print = generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice)
+            pdf_za_print = generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice)
             st.download_button(
-                label="📄 Preuzmi i isprintaj dokument za kupca (1 stranica)",
+                label="📄 Preuzmi i isprintaj dokument za kupca (uključuje sve nacrte)",
                 data=pdf_za_print,
                 file_name=f"Reklamacija_{broj_naloga}.pdf",
                 mime="application/pdf"
