@@ -51,40 +51,47 @@ def dodaj_log(postojeci_log_json, poruka):
     logovi.append(f"[{vrijeme}] {poruka}")
     return json.dumps(logovi, ensure_ascii=False)
 
-def posalji_email_obavijest(broj_naloga, kupac, status_povrata, primaoc_email):
-    """Slanje e-mail obavijesti voditelju nakon rada izdavača."""
-    # Ovdje upišite podatke vašeg SMTP poslužitelja
-    SMTP_SERVER = "smtp.gmail.com"
-    SMTP_PORT = 587
-    SENDER_EMAIL = "vas.email@gmail.com"
-    SENDER_PASSWORD = "your-app-password"
-
-    predmet = f"Obavijest o povratu reklamacije: Nalog {broj_naloga} - {status_povrata}"
-    tijelo = f"""
-    Pozdrav,
-
-    Izdavač u skladištu je ažurirao status povrata reklamacije.
-
-    • Broj naloga: {broj_naloga}
-    • Kupac: {kupac}
-    • Status povrata komada: {status_povrata}
-    • Vrijeme promjene: {datetime.datetime.now().strftime('%d.%m.%Y. u %H:%M')}
-
-    Ova poruka je automatski generirana iz sustava za reklamacije.
-    """
-
-    msg = MIMEMultipart()
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = primaoc_email
-    msg['Subject'] = predmet
-    msg.attach(MIMEText(tijelo, 'plain', 'utf-8'))
-
+def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
+    """Slanje e-mail obavijesti koristeći Streamlit Secrets."""
     try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        # Dohvaćanje postavki iz Streamlit Secrets
+        SMTP_SERVER = st.secrets["email"]["smtp_server"]
+        SMTP_PORT = int(st.secrets["email"]["smtp_port"])
+        SENDER_EMAIL = st.secrets["email"]["sender_email"]
+        SENDER_PASSWORD = st.secrets["email"]["sender_password"]
+        RECEIVER_EMAIL = st.secrets["email"]["receiver_email"]
+
+        predmet = f"Obavijest o povratu reklamacije: Nalog {broj_naloga} - {status_povrata}"
+        tijelo = f"""
+        Pozdrav,
+
+        Izdavač u skladištu je ažurirao status povrata reklamacije.
+
+        • Broj naloga: {broj_naloga}
+        • Kupac: {kupac}
+        • Status povrata komada: {status_povrata}
+        • Vrijeme promjene: {datetime.datetime.now().strftime('%d.%m.%Y. u %H:%M')}
+
+        Ova poruka je automatski generirana iz sustava za reklamacije.
+        """
+
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = predmet
+        msg.attach(MIMEText(tijelo, 'plain', 'utf-8'))
+
+        # Slanje e-maila ovisno o portu (SSL vs TLS)
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+
         return True
     except Exception as e:
         st.warning(f"Sustav nije uspio poslati e-mail obavijest: {e}")
@@ -104,7 +111,7 @@ def generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada):
     c.drawString(40, height - 67, f"Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.datetime.now().strftime('%d.%m.%Y.')}")
     c.line(40, height - 73, width - 40, height - 73)
 
-    # 2. Slika Nacrta (Pretvaranje 1. stranice nacrta u sliku)
+    # 2. Slika Nacrta
     try:
         doc_nacrt = fitz.open(stream=nacrt_bytes, filetype="pdf")
         page = doc_nacrt[0]
@@ -150,7 +157,7 @@ uloga = st.sidebar.radio("Odaberite modul:", [
 if uloga == "1. Trgovac (Unos)":
     st.header("📝 Unos nove reklamacije")
     with st.form("unos_form"):
-        col1, col2 = st.col_columns if hasattr(st, 'col_columns') else (st.columns(2))
+        col1, col2 = st.columns(2)
         with col1:
             broj_naloga = st.text_input("Broj naloga (npr. P-26370614):")
             kupac = st.text_input("Ime i prezime / Naziv kupca:")
@@ -261,15 +268,15 @@ elif uloga == "4. Skladište / Izdavač":
                     c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
                     conn.commit()
                     st.success("Spremljeno: Kupac je vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADI", "voditelj@elgrad.hr")
+                    posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADI")
             
             with col2:
                 if st.button("🔴 Kupac NIJE vratio sve komade"):
                     novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC NIJE VRATIO SVE KOMADE")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje material)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
+                    c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
                     conn.commit()
                     st.error("Spremljeno: Kupac NIJE vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADI", "voditelj@elgrad.hr")
+                    posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADI")
         else:
             st.warning("Nalog nije pronađen.")
         conn.close()
