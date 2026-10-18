@@ -11,6 +11,8 @@ import fitz  # PyMuPDF
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 # --- POSTAVKE STRANICE ---
 st.set_page_config(
@@ -36,9 +38,14 @@ def init_db():
             nacrt_pdf BLOB,
             otpremnica_pdf BLOB,
             datum_kreiranja TEXT,
-            log_promjena TEXT
+            log_promjena TEXT,
+            broj_otpremnice TEXT
         )
     ''')
+    try:
+        c.execute("ALTER TABLE reklamacije ADD COLUMN broj_otpremnice TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -52,9 +59,7 @@ def dodaj_log(postojeci_log_json, poruka):
     return json.dumps(logovi, ensure_ascii=False)
 
 def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
-    """Slanje e-mail obavijesti koristeći Streamlit Secrets."""
     try:
-        # Dohvaćanje postavki iz Streamlit Secrets
         SMTP_SERVER = st.secrets["email"]["smtp_server"]
         SMTP_PORT = int(st.secrets["email"]["smtp_port"])
         SENDER_EMAIL = st.secrets["email"]["sender_email"]
@@ -81,7 +86,6 @@ def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
         msg['Subject'] = predmet
         msg.attach(MIMEText(tijelo, 'plain', 'utf-8'))
 
-        # Slanje e-maila ovisno o portu (SSL vs TLS)
         if SMTP_PORT == 465:
             with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
                 server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -97,18 +101,20 @@ def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
         st.warning(f"Sustav nije uspio poslati e-mail obavijest: {e}")
         return False
 
-def generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada):
-    """Generira jedan A4 PDF s preslikom nacrta, napomenom i poljima za potpis."""
+def generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice):
+    """Generira jedan A4 PDF s preslikom nacrta, napomenom i podrškom za hrvatska slova."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # 1. Zaglavlje
-    c.setFont("Helvetica-Bold", 14)
+    # 1. Zaglavlje (uz uredan ispis broja otpremnice i imena s HR znakovima)
+    c.setFont("Helvetica-Bold", 13)
     c.drawString(40, height - 35, "ELGRAD d.o.o. - POTVRDA REKLAMACIJE I POVRATA")
+    
     c.setFont("Helvetica", 10)
-    c.drawString(40, height - 52, f"Radni nalog: {broj_naloga}   |   Kupac: {kupac}")
-    c.drawString(40, height - 67, f"Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.datetime.now().strftime('%d.%m.%Y.')}")
+    otpr_tekst = f" | Otpremnica: {broj_otpremnice}" if broj_otpremnice else " | Otpremnica: Nije unesena"
+    c.drawString(40, height - 52, f"Radni nalog: {broj_naloga}{otpr_tekst}")
+    c.drawString(40, height - 67, f"Kupac: {kupac}   |   Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.date.today().strftime('%d.%m.%Y.')}")
     c.line(40, height - 73, width - 40, height - 73)
 
     # 2. Slika Nacrta
@@ -160,7 +166,7 @@ if uloga == "1. Trgovac (Unos)":
         col1, col2 = st.columns(2)
         with col1:
             broj_naloga = st.text_input("Broj naloga (npr. P-26370614):")
-            kupac = st.text_input("Ime i prezime / Naziv kupca:")
+            kupac = st.text_input("Ime i prezime / Naziv kupca (podržava č, ć, š, ž, đ):")
         with col2:
             dekor = st.text_input("Dekor / Naziv artikla:")
             komada = st.number_input("Broj reklamiranih komada:", min_value=1, value=1)
@@ -189,33 +195,34 @@ if uloga == "1. Trgovac (Unos)":
 
 # --- MODUL 2: UPRAVITELJ ---
 elif uloga == "2. Upravitelj (Potvrda)":
-    st.header("✅ Odobrenje naloga i upload otpremnice")
+    st.header("✅ Odobrenje naloga, unos broja otpremnice i upload PDF-a")
     conn = sqlite3.connect("reklamacije.db")
     df = pd.read_sql_query("SELECT broj_naloga, kupac, dekor, komada, status FROM reklamacije WHERE status = 'Zaprimljeno'", conn)
     conn.close()
 
     if not df.empty:
         odabrani_nalog = st.selectbox("Odaberite nalog za odobrenje:", df['broj_naloga'].tolist())
+        broj_otpremnice = st.text_input("Broj otpremnice reklamacije (npr. ORK/PU/26-00922):")
         otpremnica_file = st.file_uploader("Priložite PDF otpremnice (ORK/PU):", type=["pdf"])
         
         if st.button("Odobri nalog"):
-            if otpremnica_file:
+            if otpremnica_file and broj_otpremnice:
                 conn = sqlite3.connect("reklamacije.db")
                 c = conn.cursor()
                 c.execute("SELECT log_promjena FROM reklamacije WHERE broj_naloga = ?", (odabrani_nalog,))
                 stari_log = c.fetchone()[0]
-                novi_log = dodaj_log(stari_log, "Upravitelj odobrio nalog i dodao otpremnicu")
+                novi_log = dodaj_log(stari_log, f"Upravitelj odobrio nalog, dodao otpremnicu {broj_otpremnice}")
                 
                 c.execute('''
                     UPDATE reklamacije 
-                    SET status = 'Odobreno', otpremnica_pdf = ?, log_promjena = ? 
+                    SET status = 'Odobreno', otpremnica_pdf = ?, broj_otpremnice = ?, log_promjena = ? 
                     WHERE broj_naloga = ?
-                ''', (otpremnica_file.read(), novi_log, odabrani_nalog))
+                ''', (otpremnica_file.read(), broj_otpremnice, novi_log, odabrani_nalog))
                 conn.commit()
                 conn.close()
-                st.success(f"Nalog {odabrani_nalog} je odobren!")
+                st.success(f"Nalog {odabrani_nalog} je odobren s brojem otpremnice {broj_otpremnice}!")
             else:
-                st.error("Priložite otpremnicu.")
+                st.error("Molimo upišite broj otpremnice i priložite PDF otpremnice.")
     else:
         st.info("Nema naloga koji čekaju odobrenje.")
 
@@ -227,15 +234,15 @@ elif uloga == "3. Blagajna (Ispis)":
     if upis_6:
         conn = sqlite3.connect("reklamacije.db")
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
         row = c.fetchone()
         conn.close()
 
         if row:
-            broj_naloga, kupac, dekor, komada, status, nacrt_bytes = row
-            st.write(f"**Nalog:** {broj_naloga} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom) | **Status:** {status}")
+            broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice = row
+            st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom)")
 
-            pdf_za_print = generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada)
+            pdf_za_print = generiraj_jednostrani_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice)
             st.download_button(
                 label="📄 Preuzmi i isprintaj dokument za kupca (1 stranica)",
                 data=pdf_za_print,
@@ -253,12 +260,12 @@ elif uloga == "4. Skladište / Izdavač":
     if upis_6:
         conn = sqlite3.connect("reklamacije.db")
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
         row = c.fetchone()
         
         if row:
-            broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_json = row
-            st.write(f"**Nalog:** {broj_naloga} | **Kupac:** {kupac} | **Materijal:** {dekor} ({komada} kom)")
+            broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_json, broj_otpremnice = row
+            st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Materijal:** {dekor} ({komada} kom)")
             st.write(f"**Trenutni status povrata:** {vraceni_komadi}")
 
             col1, col2 = st.columns(2)
@@ -268,7 +275,7 @@ elif uloga == "4. Skladište / Izdavač":
                     c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
                     conn.commit()
                     st.success("Spremljeno: Kupac je vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADI")
+                    posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADE")
             
             with col2:
                 if st.button("🔴 Kupac NIJE vratio sve komade"):
@@ -285,12 +292,12 @@ elif uloga == "4. Skladište / Izdavač":
 elif uloga == "5. Arhiva & Statistika":
     st.header("📊 Arhiva i Statistika Povrata")
     conn = sqlite3.connect("reklamacije.db")
-    df = pd.read_sql_query("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, datum_kreiranja, log_promjena FROM reklamacije", conn)
+    df = pd.read_sql_query("SELECT broj_naloga, broj_otpremnice, kupac, dekor, komada, status, vraceni_komadi, datum_kreiranja, log_promjena FROM reklamacije", conn)
     conn.close()
 
     if not df.empty:
         st.subheader("📋 Arhiva svih naloga")
-        st.dataframe(df[['broj_naloga', 'kupac', 'dekor', 'komada', 'status', 'vraceni_komadi', 'datum_kreiranja']], use_container_width=True)
+        st.dataframe(df[['broj_naloga', 'broj_otpremnice', 'kupac', 'dekor', 'komada', 'status', 'vraceni_komadi', 'datum_kreiranja']], use_container_width=True)
 
         st.subheader("📈 Statistika povrata")
         stat_df = df['vraceni_komadi'].value_counts().reset_index()
