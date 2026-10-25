@@ -21,9 +21,18 @@ st.set_page_config(
 
 # --- SPAJANJE NA SUPABASE BAZU ---
 def get_db_connection():
-    db_url = st.secrets["database"]["url"]
-    conn = psycopg2.connect(db_url)
-    return conn
+    try:
+        db_url = st.secrets["database"]["url"]
+        if "?" not in db_url:
+            db_url += "?sslmode=require"
+        elif "sslmode" not in db_url:
+            db_url += "&sslmode=require"
+            
+        conn = psycopg2.connect(db_url)
+        return conn
+    except Exception as e:
+        st.error(f"Greška kod spajanja na bazu: {e}")
+        st.stop()
 
 def init_db():
     conn = get_db_connection()
@@ -54,12 +63,8 @@ def ocisti_stare_reklamacije():
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        # Računamo datum prije 60 dana
         granica_datuma = datetime.date.today() - datetime.timedelta(days=60)
-        granica_str = granica_datuma.strftime("%d.%m.%Y.")
         
-        # Brišemo zapise čiji je datum kreiranja stariji od 60 dana
-        # (Možeš prilagoditi uvjet da briše samo one čiji je status 'Riješeno' ili sve redom)
         c.execute('''
             DELETE FROM reklamacije 
             WHERE TO_DATE(datum_kreiranja, 'DD.MM.YYYY.') < %s
@@ -68,8 +73,7 @@ def ocisti_stare_reklamacije():
         conn.commit()
         c.close()
         conn.close()
-    except Exception as e:
-        # Ignoriramo grešku ako tablica još nema ispravan format datuma
+    except Exception:
         pass
 
 init_db()
