@@ -242,7 +242,7 @@ if uloga == "1. Trgovac (Unos)":
                 conn.commit()
                 c.close()
                 conn.close()
-                st.success(f"Nalog {broj_naloga} je uspješno spremljen pod pretragom: {zadnjih_6}")
+                st.success(f"Nalog {broj_naloga} je uspješno spremljen!")
             else:
                 st.error("Molimo ispunite sva polja i priložite PDF nacrta.")
 
@@ -296,17 +296,28 @@ elif uloga == "2. Upravitelj (Potvrda)":
 # --- MODUL 3: BLAGAJNA ---
 elif uloga == "3. Blagajna (Ispis)":
     st.header("🖨️ Blagajna - Pretraga i ispis dokumenta za kupca")
-    upis_6 = st.text_input("Upišite zadnjih 6 znamenki naloga:", max_chars=6)
+    upis_pretraga = st.text_input("Pretraga (upiši cijeli broj naloga, dio broja ili zadnje znamenke, npr. P-26353690 ili 3690):")
 
-    if upis_6:
+    if upis_pretraga:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice, nacin_povrata FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
-        row = c.fetchone()
+        c.execute("""
+            SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice, nacin_povrata 
+            FROM reklamacije 
+            WHERE broj_naloga ILIKE %s OR zadnjih_6 ILIKE %s
+        """, (f"%{upis_pretraga.strip()}%", f"%{upis_pretraga.strip()}%"))
+        rows = c.fetchall()
         c.close()
         conn.close()
 
-        if row:
+        if rows:
+            if len(rows) == 1:
+                row = rows[0]
+            else:
+                options = {r[0]: f"Nalog: {r[0]} | Kupac: {r[1]} | Dekor: {r[2]} ({r[3]} kom)" for r in rows}
+                odabrani_kljuc = st.selectbox("Pronađeno više naloga. Odaberite točan nalog:", list(options.keys()), format_func=lambda x: options[x])
+                row = next(r for r in rows if r[0] == odabrani_kljuc)
+
             broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice, nacin_povrata = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom)")
             st.info(f"Odabrani način obrade: **{nacin_povrata if nacin_povrata else 'Standardni povrat (kupac vraća komade)'}**")
@@ -319,25 +330,35 @@ elif uloga == "3. Blagajna (Ispis)":
                 mime="application/pdf"
             )
         else:
-            st.warning("Nalog s tim brojem nije pronađen.")
+            st.warning("Nalog s tim pojmom nije pronađen.")
 
 # --- MODUL 4: IZDAVAČ / SKLADIŠTE ---
 elif uloga == "4. Skladište / Izdavač":
     st.header("📦 Skladište - Evidencija povrata reklamiranih komada")
-    upis_6 = st.text_input("Pretraga po 6 znamenki naloga za izdavanje:", max_chars=6)
+    upis_pretraga = st.text_input("Pretraga skladišta (upiši broj naloga, dio broja ili zadnje znamenke):")
 
-    if upis_6:
+    if upis_pretraga:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice, nacin_povrata FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
-        row = c.fetchone()
+        c.execute("""
+            SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice, nacin_povrata 
+            FROM reklamacije 
+            WHERE broj_naloga ILIKE %s OR zadnjih_6 ILIKE %s
+        """, (f"%{upis_pretraga.strip()}%", f"%{upis_pretraga.strip()}%"))
+        rows = c.fetchall()
         
-        if row:
+        if rows:
+            if len(rows) == 1:
+                row = rows[0]
+            else:
+                options = {r[0]: f"Nalog: {r[0]} | Kupac: {r[1]} | Dekor: {r[2]} ({r[3]} kom)" for r in rows}
+                odabrani_kljuc = st.selectbox("Pronađeno više naloga. Odaberite točan nalog za izdavanje:", list(options.keys()), format_func=lambda x: options[x])
+                row = next(r for r in rows if r[0] == odabrani_kljuc)
+
             broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_json, broj_otpremnice, nacin_povrata = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Materijal:** {dekor} ({komada} kom)")
             st.info(f"Definirano pravilo od upravitelja: **{nacin_povrata if nacin_povrata else 'Standardni povrat (kupac vraća komade)'}**")
             
-            # Provjera pravila: Ako je standardni povrat, nudimo dva gumba (vratio/nije vratio). Ako su ostale dvije opcije, nudimo samo potvrdu izdavanja.
             is_standardni = (not nacin_povrata) or ("Standardni povrat" in nacin_povrata)
 
             if is_standardni:
@@ -346,28 +367,27 @@ elif uloga == "4. Skladište / Izdavač":
                 with col1:
                     if st.button("🟢 Kupac je VRATIO SVE komade"):
                         novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC VRATIO SVE KOMADE")
-                        c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
+                        c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = %s WHERE broj_naloga = %s", (novi_log, broj_naloga))
                         conn.commit()
                         st.success("Spremljeno: Kupac je vratio sve komade!")
                         posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADE")
                 with col2:
                     if st.button("🔴 Kupac NIJE vratio sve komade"):
                         novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC NIJE VRATIO SVE KOMADE")
-                        c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
+                        c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = %s WHERE broj_naloga = %s", (novi_log, broj_naloga))
                         conn.commit()
                         st.error("Spremljeno: Kupac NIJE vratio sve komade!")
                         posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADE")
             else:
-                # Za ostale dvije opcije (ostavljeno u skladištu ili premali komadi)
                 st.write(f"**Trenutni status obrade:** {vraceni_komadi}")
                 if st.button("✅ Potvrdi izdavanje zamjenskog materijala (Povrat nije potreban / Materijal je u skladištu)"):
                     novi_log = dodaj_log(log_json, f"Izdavač potvrdio izdavanje po pravilu: {nacin_povrata}")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = %s, log_promjena = %s WHERE zadnjih_6 = %s", (nacin_povrata, novi_log, upis_6))
+                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = %s, log_promjena = %s WHERE broj_naloga = %s", (nacin_povrata, novi_log, broj_naloga))
                     conn.commit()
                     st.success("Spremljeno: Reklamacija riješena i zatvorena!")
                     posalji_email_obavijest(broj_naloga, kupac, f"ZAVRŠENO - {nacin_povrata}")
         else:
-            st.warning("Nalog nije pronađen.")
+            st.warning("Nalog s tim pojmom nije pronađen.")
         c.close()
         conn.close()
 
