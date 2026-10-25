@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3
+import psycopg2
 import json
 import io
 import smtplib
@@ -19,9 +19,14 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- BAZA PODATAKA (SQLite) ---
+# --- SPAJANJE NA SUPABASE BAZU ---
+def get_db_connection():
+    db_url = st.secrets["database"]["url"]
+    conn = psycopg2.connect(db_url)
+    return conn
+
 def init_db():
-    conn = sqlite3.connect("reklamacije.db")
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS reklamacije (
@@ -33,21 +38,42 @@ def init_db():
             komada INTEGER,
             status TEXT,
             vraceni_komadi TEXT,
-            nacrt_pdf BLOB,
-            otpremnica_pdf BLOB,
+            nacrt_pdf BYTEA,
+            otpremnica_pdf BYTEA,
             datum_kreiranja TEXT,
             log_promjena TEXT,
             broj_otpremnice TEXT
         )
     ''')
-    try:
-        c.execute("ALTER TABLE reklamacije ADD COLUMN broj_otpremnice TEXT")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
+    c.close()
     conn.close()
 
+def ocisti_stare_reklamacije():
+    """Automatski briše reklamacije starije od 60 dana (2 mjeseca)."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        # Računamo datum prije 60 dana
+        granica_datuma = datetime.date.today() - datetime.timedelta(days=60)
+        granica_str = granica_datuma.strftime("%d.%m.%Y.")
+        
+        # Brišemo zapise čiji je datum kreiranja stariji od 60 dana
+        # (Možeš prilagoditi uvjet da briše samo one čiji je status 'Riješeno' ili sve redom)
+        c.execute('''
+            DELETE FROM reklamacije 
+            WHERE TO_DATE(datum_kreiranja, 'DD.MM.YYYY.') < %s
+        ''', (granica_datuma,))
+        
+        conn.commit()
+        c.close()
+        conn.close()
+    except Exception as e:
+        # Ignoriramo grešku ako tablica još nema ispravan format datuma
+        pass
+
 init_db()
+ocisti_stare_reklamacije()
 
 # --- POMOĆNE FUNKCIJE ---
 def dodaj_log(postojeci_log_json, poruka):
@@ -57,7 +83,6 @@ def dodaj_log(postojeci_log_json, poruka):
     return json.dumps(logovi, ensure_ascii=False)
 
 def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
-    """Slanje e-mail obavijesti koristeći Streamlit Secrets."""
     try:
         SMTP_SERVER = st.secrets["email"]["smtp_server"]
         SMTP_PORT = int(st.secrets["email"]["smtp_port"])
@@ -101,31 +126,23 @@ def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
         return False
 
 def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice):
-    """
-    Automatski prepoznaje SVE nacrte (stranice bez riječi 'Statistika') 
-    iz PanelWizard PDF-a i za svaki generira stranicu s napomenom i potpisom.
-    """
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
     doc_nacrt = fitz.open(stream=nacrt_bytes, filetype="pdf")
-    
-    # Filtriramo samo stranice koje su nacrti (ne sadrže riječ "Statistika")
     nacrt_stranice = []
     for page in doc_nacrt:
         text = page.get_text()
         if "Statistika" not in text:
             nacrt_stranice.append(page)
             
-    # Fallback ako nijedna stranica nije zadovoljila uvjet
     if not nacrt_stranice:
         nacrt_stranice = [doc_nacrt[0]]
 
     total_stranica = len(nacrt_stranice)
 
     for i, page in enumerate(nacrt_stranice):
-        # 1. Zaglavlje
         c.setFont("Helvetica-Bold", 12)
         c.drawString(40, height - 35, f"ELGRAD d.o.o. - POTVRDA REKLAMACIJE I POVRATA (Dio {i+1} od {total_stranica})")
         
@@ -135,7 +152,6 @@ def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_
         c.drawString(40, height - 67, f"Kupac: {kupac}   |   Stavka: {dekor} ({komada} kom)   |   Datum: {datetime.date.today().strftime('%d.%m.%Y.')}")
         c.line(40, height - 73, width - 40, height - 73)
 
-        # 2. Slika Nacrta za tekuću stranicu
         try:
             pix = page.get_pixmap(dpi=150)
             img_bytes = pix.tobytes("png")
@@ -144,7 +160,6 @@ def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_
         except Exception:
             c.drawString(40, height / 2, "[Nije moguće prikazati vizualni nacrt]")
 
-        # 3. Dno stranice: Napomena i Potpis
         c.line(40, 145, width - 40, 145)
         c.rect(40, 75, width - 80, 62, fill=0)
 
@@ -160,7 +175,6 @@ def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_
         c.drawString(50, 38, "Preuzeo kupac (potpis): _______________________")
         c.drawString(320, 38, "Izdano / Potvrdio (potpis): _______________________")
 
-        # Ako ima još nacrta, dodaj novu stranicu u PDF
         if i < total_stranica - 1:
             c.showPage()
 
@@ -190,7 +204,7 @@ if uloga == "1. Trgovac (Unos)":
             dekor = st.text_input("Dekor / Naziv artikla:")
             komada = st.number_input("Broj reklamiranih komada:", min_value=1, value=1)
         
-        nacrt_file = st.file_uploader("Priložite PDF nacrta (PanelWizard - podržava i više materijala/stranica):", type=["pdf"])
+        nacrt_file = st.file_uploader("Priložite PDF nacrta (PanelWizard):", type=["pdf"])
         submit = st.form_submit_button("Spremi reklamaciju")
 
         if submit:
@@ -199,14 +213,16 @@ if uloga == "1. Trgovac (Unos)":
                 nacrt_bytes = nacrt_file.read()
                 log_inital = dodaj_log("", f"Trgovac kreirao nalog {broj_naloga}")
                 
-                conn = sqlite3.connect("reklamacije.db")
+                conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('''
                     INSERT INTO reklamacije 
                     (id, broj_naloga, zadnjih_6, kupac, dekor, komada, status, vraceni_komadi, nacrt_pdf, datum_kreiranja, log_promjena)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (broj_naloga, broj_naloga, zadnjih_6, kupac, dekor, komada, 'Zaprimljeno', 'Čeka obradu', nacrt_bytes, datetime.date.today().strftime("%d.%m.%Y."), log_inital))
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                ''', (broj_naloga, broj_naloga, zadnjih_6, kupac, dekor, komada, 'Zaprimljeno', 'Čeka obradu', psycopg2.Binary(nacrt_bytes), datetime.date.today().strftime("%d.%m.%Y."), log_inital))
                 conn.commit()
+                c.close()
                 conn.close()
                 st.success(f"Nalog {broj_naloga} je uspješno spremljen pod pretragom: {zadnjih_6}")
             else:
@@ -215,7 +231,7 @@ if uloga == "1. Trgovac (Unos)":
 # --- MODUL 2: UPRAVITELJ ---
 elif uloga == "2. Upravitelj (Potvrda)":
     st.header("✅ Odobrenje naloga, unos broja otpremnice i upload PDF-a")
-    conn = sqlite3.connect("reklamacije.db")
+    conn = get_db_connection()
     df = pd.read_sql_query("SELECT broj_naloga, kupac, dekor, komada, status FROM reklamacije WHERE status = 'Zaprimljeno'", conn)
     conn.close()
 
@@ -226,18 +242,20 @@ elif uloga == "2. Upravitelj (Potvrda)":
         
         if st.button("Odobri nalog"):
             if otpremnica_file and broj_otpremnice:
-                conn = sqlite3.connect("reklamacije.db")
+                conn = get_db_connection()
                 c = conn.cursor()
-                c.execute("SELECT log_promjena FROM reklamacije WHERE broj_naloga = ?", (odabrani_nalog,))
-                stari_log = c.fetchone()[0]
+                c.execute("SELECT log_promjena FROM reklamacije WHERE broj_naloga = %s", (odabrani_nalog,))
+                res = c.fetchone()
+                stari_log = res[0] if res else ""
                 novi_log = dodaj_log(stari_log, f"Upravitelj odobrio nalog, dodao otpremnicu {broj_otpremnice}")
                 
                 c.execute('''
                     UPDATE reklamacije 
-                    SET status = 'Odobreno', otpremnica_pdf = ?, broj_otpremnice = ?, log_promjena = ? 
-                    WHERE broj_naloga = ?
-                ''', (otpremnica_file.read(), broj_otpremnice, novi_log, odabrani_nalog))
+                    SET status = 'Odobreno', otpremnica_pdf = %s, broj_otpremnice = %s, log_promjena = %s 
+                    WHERE broj_naloga = %s
+                ''', (psycopg2.Binary(otpremnica_file.read()), broj_otpremnice, novi_log, odabrani_nalog))
                 conn.commit()
+                c.close()
                 conn.close()
                 st.success(f"Nalog {odabrani_nalog} je odobren s brojem otpremnice {broj_otpremnice}!")
             else:
@@ -248,22 +266,23 @@ elif uloga == "2. Upravitelj (Potvrda)":
 # --- MODUL 3: BLAGAJNA ---
 elif uloga == "3. Blagajna (Ispis)":
     st.header("🖨️ Blagajna - Pretraga i ispis dokumenta za kupca")
-    upis_6 = st.text_input("Upišite zadnjih 6 znamenki naloga (npr. 353690):", max_chars=6)
+    upis_6 = st.text_input("Upišite zadnjih 6 znamenki naloga:", max_chars=6)
 
     if upis_6:
-        conn = sqlite3.connect("reklamacije.db")
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
         row = c.fetchone()
+        c.close()
         conn.close()
 
         if row:
             broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom)")
 
-            pdf_za_print = generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice)
+            pdf_za_print = generiraj_zapisnik_pdf(bytes(nacrt_bytes), broj_naloga, kupac, dekor, komada, broj_otpremnice)
             st.download_button(
-                label="📄 Preuzmi i isprintaj dokument za kupca (uključuje sve nacrte)",
+                label="📄 Preuzmi i isprintaj dokument za kupca",
                 data=pdf_za_print,
                 file_name=f"Reklamacija_{broj_naloga}.pdf",
                 mime="application/pdf"
@@ -277,9 +296,9 @@ elif uloga == "4. Skladište / Izdavač":
     upis_6 = st.text_input("Pretraga po 6 znamenki naloga za izdavanje:", max_chars=6)
 
     if upis_6:
-        conn = sqlite3.connect("reklamacije.db")
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = ?", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
         row = c.fetchone()
         
         if row:
@@ -291,7 +310,7 @@ elif uloga == "4. Skladište / Izdavač":
             with col1:
                 if st.button("🟢 Kupac je VRATIO SVE komade"):
                     novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC VRATIO SVE KOMADE")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
+                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
                     conn.commit()
                     st.success("Spremljeno: Kupac je vratio sve komade!")
                     posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADE")
@@ -299,23 +318,24 @@ elif uloga == "4. Skladište / Izdavač":
             with col2:
                 if st.button("🔴 Kupac NIJE vratio sve komade"):
                     novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC NIJE VRATIO SVE KOMADE")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = ? WHERE zadnjih_6 = ?", (novi_log, upis_6))
+                    c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
                     conn.commit()
                     st.error("Spremljeno: Kupac NIJE vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADI")
+                    posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADE")
         else:
             st.warning("Nalog nije pronađen.")
+        c.close()
         conn.close()
 
 # --- MODUL 5: ARHIVA & STATISTIKA ---
 elif uloga == "5. Arhiva & Statistika":
-    st.header("📊 Arhiva i Statistika Povrata")
-    conn = sqlite3.connect("reklamacije.db")
+    st.header("📊 Arhiva i Statistika Povrata (Zadnja 2 mjeseca)")
+    conn = get_db_connection()
     df = pd.read_sql_query("SELECT broj_naloga, broj_otpremnice, kupac, dekor, komada, status, vraceni_komadi, datum_kreiranja, log_promjena FROM reklamacije", conn)
     conn.close()
 
     if not df.empty:
-        st.subheader("📋 Arhiva svih naloga")
+        st.subheader("📋 Arhiva aktivnih naloga")
         st.dataframe(df[['broj_naloga', 'broj_otpremnice', 'kupac', 'dekor', 'komada', 'status', 'vraceni_komadi', 'datum_kreiranja']], use_container_width=True)
 
         st.subheader("📈 Statistika povrata")
