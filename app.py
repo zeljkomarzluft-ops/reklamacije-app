@@ -51,9 +51,14 @@ def init_db():
             otpremnica_pdf BYTEA,
             datum_kreiranja TEXT,
             log_promjena TEXT,
-            broj_otpremnice TEXT
+            broj_otpremnice TEXT,
+            nacin_povrata TEXT
         )
     ''')
+    try:
+        c.execute('ALTER TABLE reklamacije ADD COLUMN IF NOT EXISTS nacin_povrata TEXT;')
+    except Exception:
+        pass
     conn.commit()
     c.close()
     conn.close()
@@ -129,7 +134,7 @@ def posalji_email_obavijest(broj_naloga, kupac, status_povrata):
         st.warning(f"Sustav nije uspio poslati e-mail obavijest: {e}")
         return False
 
-def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice):
+def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_otpremnice, nacin_povrata):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
@@ -171,9 +176,18 @@ def generiraj_zapisnik_pdf(nacrt_bytes, broj_naloga, kupac, dekor, komada, broj_
         c.drawString(50, 125, "NAPOMENA O PREUZIMANJU I POVRATU REKLAMIRANOG MATERIJALA:")
         c.setFont("Helvetica", 8)
         c.drawString(50, 111, "• Kupac preuzima nove/zamjenske komade specificirane u dokumentu u potpunosti ispravne.")
-        c.drawString(50, 98, f"• NAPOMENA: Kupac je prilikom preuzimanja vratio sve reklamirane komade ({komada} kom - {dekor}).")
+        
+        # Dinamički ispis napomene na PDF-u ovisno o odabiru upravitelja
         c.setFont("Helvetica-Bold", 8)
-        c.drawString(50, 85, "[  ] KUPAC JE VRATIO SVE KOMADE            [  ] KUPAC NIJE VRATIO SVE KOMADE")
+        if nacin_povrata == "Standardni povrat (kupac vraća komade)":
+            napomena_txt = f"• STATUS: KUPAC JE OBVEZAN VRATITI SVE KOMADE ({komada} kom - {dekor})."
+        elif nacin_povrata == "Kupac ostavio oštećene komade u skladištu":
+            napomena_txt = "• STATUS: KUPAC JE OSTAVIO OŠTEĆENE KOMADE U SKLADIŠTU."
+        else:
+            napomena_txt = "• STATUS: KOMADI SU PREMALI - KUPAC NE MORA VRATITI KOMADE."
+        
+        c.drawString(50, 98, napomena_txt)
+        c.drawString(50, 85, f"Odabrani način obrade: {nacin_povrata if nacin_povrata else 'Standardni'}")
 
         c.setFont("Helvetica", 9)
         c.drawString(50, 38, "Preuzeo kupac (potpis): _______________________")
@@ -234,7 +248,7 @@ if uloga == "1. Trgovac (Unos)":
 
 # --- MODUL 2: UPRAVITELJ ---
 elif uloga == "2. Upravitelj (Potvrda)":
-    st.header("✅ Odobrenje naloga, unos broja otpremnice i upload PDF-a")
+    st.header("✅ Odobrenje naloga, način povrata i unos otpremnice")
     conn = get_db_connection()
     df = pd.read_sql_query("SELECT broj_naloga, kupac, dekor, komada, status FROM reklamacije WHERE status = 'Zaprimljeno'", conn)
     conn.close()
@@ -242,6 +256,18 @@ elif uloga == "2. Upravitelj (Potvrda)":
     if not df.empty:
         odabrani_nalog = st.selectbox("Odaberite nalog za odobrenje:", df['broj_naloga'].tolist())
         broj_otpremnice = st.text_input("Broj otpremnice reklamacije (npr. ORK/PU/26-00922):")
+        
+        st.markdown("### Odaberite pravilo povrata/obrade materijala:")
+        nacin_povrata = st.radio(
+            "Način povrata:",
+            [
+                "Standardni povrat (kupac vraća komade)",
+                "Kupac ostavio oštećene komade u skladištu",
+                "Komadi premali za iskorištavanje (povrat nije potreban)"
+            ],
+            label_visibility="collapsed"
+        )
+        
         otpremnica_file = st.file_uploader("Priložite PDF otpremnice (ORK/PU):", type=["pdf"])
         
         if st.button("Odobri nalog"):
@@ -251,17 +277,17 @@ elif uloga == "2. Upravitelj (Potvrda)":
                 c.execute("SELECT log_promjena FROM reklamacije WHERE broj_naloga = %s", (odabrani_nalog,))
                 res = c.fetchone()
                 stari_log = res[0] if res else ""
-                novi_log = dodaj_log(stari_log, f"Upravitelj odobrio nalog, dodao otpremnicu {broj_otpremnice}")
+                novi_log = dodaj_log(stari_log, f"Upravitelj odobrio nalog, dodao otpremnicu {broj_otpremnice} [Način povrata: {nacin_povrata}]")
                 
                 c.execute('''
                     UPDATE reklamacije 
-                    SET status = 'Odobreno', otpremnica_pdf = %s, broj_otpremnice = %s, log_promjena = %s 
+                    SET status = 'Odobreno', otpremnica_pdf = %s, broj_otpremnice = %s, nacin_povrata = %s, log_promjena = %s 
                     WHERE broj_naloga = %s
-                ''', (psycopg2.Binary(otpremnica_file.read()), broj_otpremnice, novi_log, odabrani_nalog))
+                ''', (psycopg2.Binary(otpremnica_file.read()), broj_otpremnice, nacin_povrata, novi_log, odabrani_nalog))
                 conn.commit()
                 c.close()
                 conn.close()
-                st.success(f"Nalog {odabrani_nalog} je odobren s brojem otpremnice {broj_otpremnice}!")
+                st.success(f"Nalog {odabrani_nalog} je odobren s načinom povrata: '{nacin_povrata}'!")
             else:
                 st.error("Molimo upišite broj otpremnice i priložite PDF otpremnice.")
     else:
@@ -275,16 +301,17 @@ elif uloga == "3. Blagajna (Ispis)":
     if upis_6:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, nacrt_pdf, broj_otpremnice, nacin_povrata FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
         row = c.fetchone()
         c.close()
         conn.close()
 
         if row:
-            broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice = row
+            broj_naloga, kupac, dekor, komada, status, nacrt_bytes, broj_otpremnice, nacin_povrata = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Dekor:** {dekor} ({komada} kom)")
+            st.info(f"Odabrani način obrade: **{nacin_povrata if nacin_povrata else 'Standardni povrat (kupac vraća komade)'}**")
 
-            pdf_za_print = generiraj_zapisnik_pdf(bytes(nacrt_bytes), broj_naloga, kupac, dekor, komada, broj_otpremnice)
+            pdf_za_print = generiraj_zapisnik_pdf(bytes(nacrt_bytes), broj_naloga, kupac, dekor, komada, broj_otpremnice, nacin_povrata)
             st.download_button(
                 label="📄 Preuzmi i isprintaj dokument za kupca",
                 data=pdf_za_print,
@@ -302,30 +329,43 @@ elif uloga == "4. Skladište / Izdavač":
     if upis_6:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
+        c.execute("SELECT broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_promjena, broj_otpremnice, nacin_povrata FROM reklamacije WHERE zadnjih_6 = %s", (upis_6,))
         row = c.fetchone()
         
         if row:
-            broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_json, broj_otpremnice = row
+            broj_naloga, kupac, dekor, komada, status, vraceni_komadi, log_json, broj_otpremnice, nacin_povrata = row
             st.write(f"**Nalog:** {broj_naloga} | **Otpremnica:** {broj_otpremnice} | **Kupac:** {kupac} | **Materijal:** {dekor} ({komada} kom)")
-            st.write(f"**Trenutni status povrata:** {vraceni_komadi}")
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🟢 Kupac je VRATIO SVE komade"):
-                    novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC VRATIO SVE KOMADE")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
-                    conn.commit()
-                    st.success("Spremljeno: Kupac je vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADE")
+            st.info(f"Definirano pravilo od upravitelja: **{nacin_povrata if nacin_povrata else 'Standardni povrat (kupac vraća komade)'}**")
             
-            with col2:
-                if st.button("🔴 Kupac NIJE vratio sve komade"):
-                    novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC NIJE VRATIO SVE KOMADE")
-                    c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
+            # Provjera pravila: Ako je standardni povrat, nudimo dva gumba (vratio/nije vratio). Ako su ostale dvije opcije, nudimo samo potvrdu izdavanja.
+            is_standardni = (not nacin_povrata) or ("Standardni povrat" in nacin_povrata)
+
+            if is_standardni:
+                st.write(f"**Trenutni status povrata:** {vraceni_komadi}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🟢 Kupac je VRATIO SVE komade"):
+                        novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC VRATIO SVE KOMADE")
+                        c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = 'Vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
+                        conn.commit()
+                        st.success("Spremljeno: Kupac je vratio sve komade!")
+                        posalji_email_obavijest(broj_naloga, kupac, "VRAĆENI SVI KOMADE")
+                with col2:
+                    if st.button("🔴 Kupac NIJE vratio sve komade"):
+                        novi_log = dodaj_log(log_json, "Izdavač potvrdio: KUPAC NIJE VRATIO SVE KOMADE")
+                        c.execute("UPDATE reklamacije SET status = 'Riješeno (Nedostaje materijal)', vraceni_komadi = 'NISU vraćeni svi komadi', log_promjena = %s WHERE zadnjih_6 = %s", (novi_log, upis_6))
+                        conn.commit()
+                        st.error("Spremljeno: Kupac NIJE vratio sve komade!")
+                        posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADE")
+            else:
+                # Za ostale dvije opcije (ostavljeno u skladištu ili premali komadi)
+                st.write(f"**Trenutni status obrade:** {vraceni_komadi}")
+                if st.button("✅ Potvrdi izdavanje zamjenskog materijala (Povrat nije potreban / Materijal je u skladištu)"):
+                    novi_log = dodaj_log(log_json, f"Izdavač potvrdio izdavanje po pravilu: {nacin_povrata}")
+                    c.execute("UPDATE reklamacije SET status = 'Riješeno', vraceni_komadi = %s, log_promjena = %s WHERE zadnjih_6 = %s", (nacin_povrata, novi_log, upis_6))
                     conn.commit()
-                    st.error("Spremljeno: Kupac NIJE vratio sve komade!")
-                    posalji_email_obavijest(broj_naloga, kupac, "NISU VRAĆENI SVI KOMADE")
+                    st.success("Spremljeno: Reklamacija riješena i zatvorena!")
+                    posalji_email_obavijest(broj_naloga, kupac, f"ZAVRŠENO - {nacin_povrata}")
         else:
             st.warning("Nalog nije pronađen.")
         c.close()
@@ -335,17 +375,17 @@ elif uloga == "4. Skladište / Izdavač":
 elif uloga == "5. Arhiva & Statistika":
     st.header("📊 Arhiva i Statistika Povrata (Zadnja 2 mjeseca)")
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT broj_naloga, broj_otpremnice, kupac, dekor, komada, status, vraceni_komadi, datum_kreiranja, log_promjena FROM reklamacije", conn)
+    df = pd.read_sql_query("SELECT broj_naloga, broj_otpremnice, kupac, dekor, komada, status, vraceni_komadi, nacin_povrata, datum_kreiranja, log_promjena FROM reklamacije", conn)
     conn.close()
 
     if not df.empty:
         st.subheader("📋 Arhiva aktivnih naloga")
-        st.dataframe(df[['broj_naloga', 'broj_otpremnice', 'kupac', 'dekor', 'komada', 'status', 'vraceni_komadi', 'datum_kreiranja']], use_container_width=True)
+        st.dataframe(df[['broj_naloga', 'broj_otpremnice', 'kupac', 'dekor', 'komada', 'status', 'vraceni_komadi', 'nacin_povrata', 'datum_kreiranja']], use_container_width=True)
 
-        st.subheader("📈 Statistika povrata")
+        st.subheader("📈 Statistika povrata / načina obrade")
         stat_df = df['vraceni_komadi'].value_counts().reset_index()
-        stat_df.columns = ['Status povrata', 'Broj naloga']
-        st.bar_chart(stat_df.set_index('Status povrata'))
+        stat_df.columns = ['Status / Način', 'Broj naloga']
+        st.bar_chart(stat_df.set_index('Status / Način'))
 
         st.subheader("📜 Pregled Loga promjena")
         odabrani_nalog = st.selectbox("Odaberite nalog za pregled povijesti:", df['broj_naloga'].tolist())
